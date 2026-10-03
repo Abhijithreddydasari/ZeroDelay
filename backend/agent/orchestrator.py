@@ -18,7 +18,7 @@ from typing import Any
 
 from .. import config
 from ..data_loader import Procedure, load_corpus
-from ..index.retriever import Retriever
+from ..index.retriever import Retriever, RetrievalResult, RetrievedProcedure, RetrievedDiagram
 from ..tools import reference_tools
 from ..tools.sensor_sim import get_simulator
 from . import prompt_builder
@@ -114,15 +114,18 @@ class Orchestrator:
         query: str,
         live_image_path: str | Path | None = None,
         speak: bool = True,
+        procedure_id: str | None = None,
+        step_id: int | None = None,
     ) -> dict[str, Any]:
         t_start = time.perf_counter()
-        ctx = self._prepare_turn(query, live_image_path)
+        ctx = self._prepare_turn(query, live_image_path, procedure_id, step_id)
 
         t_gen = time.perf_counter()
         raw = self.gemma.reason(ctx["prompt"], images=ctx["images"])
         generate_ms = (time.perf_counter() - t_gen) * 1000
 
-        decision = self._finalize_decision(parse_decision(raw) or fallback_decision(raw))
+        parsed = parse_decision(raw)
+        decision = self._finalize_decision(parsed or fallback_decision(raw))
 
         tts_path = None
         tts_ms = 0.0
@@ -132,13 +135,19 @@ class Orchestrator:
             tts_ms = (time.perf_counter() - t_tts) * 1000
 
         self._log_timing(t_start, ctx["retrieve_ms"], generate_ms, tts_ms, ctx["images"])
-        return self._build_result(query, decision, ctx, tts_path)
+        result = self._build_result(query, decision, ctx, tts_path, parsed is not None)
+        result["timing_ms"] = {"retrieve": round(ctx["retrieve_ms"]),
+            "prompt": round(ctx["prompt_ms"]), "generation_call": round(generate_ms),
+            "tts": round(tts_ms), **self.gemma.last_metrics()}
+        return result
 
     def stream_text(
         self,
         query: str,
         live_image_path: str | Path | None = None,
         speak: bool = True,
+        procedure_id: str | None = None,
+        step_id: int | None = None,
     ) -> Iterator[tuple[str, Any]]:
         """Single-pass turn that streams the spoken answer as it is generated.
 
@@ -148,7 +157,7 @@ class Orchestrator:
         the words stream steadily instead of pausing for mid-answer tool round-trips.
         """
         t_start = time.perf_counter()
-        ctx = self._prepare_turn(query, live_image_path)
+        ctx = self._prepare_turn(query, live_image_path, procedure_id, step_id)
 
         raw_parts: list[str] = []
         emitted = 0
@@ -162,7 +171,8 @@ class Orchestrator:
         generate_ms = (time.perf_counter() - t_gen) * 1000
 
         raw = "".join(raw_parts)
-        decision = self._finalize_decision(parse_decision(raw) or fallback_decision(raw))
+        parsed = parse_decision(raw)
+        decision = self._finalize_decision(parsed or fallback_decision(raw))
 
         tts_path = None
         tts_ms = 0.0
@@ -172,16 +182,24 @@ class Orchestrator:
             tts_ms = (time.perf_counter() - t_tts) * 1000
 
         self._log_timing(t_start, ctx["retrieve_ms"], generate_ms, tts_ms, ctx["images"])
-        yield ("final", self._build_result(query, decision, ctx, tts_path))
+        yield ("final", self._build_result(query, decision, ctx, tts_path, parsed is not None))
 
     # ------------------------------------------------------------------
     def _prepare_turn(
-        self, query: str, live_image_path: str | Path | None
+        self, query: str, live_image_path: str | Path | None,
+        procedure_id: str | None = None, step_id: int | None = None,
     ) -> dict[str, Any]:
         """Everything a single reasoning pass needs: retrieval, telemetry, resolved
         reference facts, the (optional) diagram image, and the built prompt."""
         t_retrieve = time.perf_counter()
-        retrieval = self.retriever.retrieve(query)
+        if procedure_id and procedure_id in self.corpus.procedures:
+            proc = self.corpus.procedures[procedure_id]
+            retrieval = RetrievalResult(query=query,
+                procedures=[RetrievedProcedure(proc.procedure_id, proc.title, 1.0)],
+                diagrams=[RetrievedDiagram(d.diagram_id, d.title, str(d.image_path), d.image_exists, 0.0)
+                          for did in proc.related_diagrams if (d := self.corpus.diagrams.get(did))])
+        else:
+            retrieval = self.retriever.retrieve(query)
         retrieve_ms = (time.perf_counter() - t_retrieve) * 1000
 
         # Relevant live telemetry for the selected procedure.
@@ -195,7 +213,7 @@ class Orchestrator:
             if retrieval.top_procedure_id
             else None
         )
-        resolved_facts = self._resolve_reference_facts(proc)
+        resolved_facts = self._resolve_reference_facts(proc, step_id)
 
         # Vision is the biggest per-turn cost, so only attach a reference diagram when the
         # turn actually needs it (a camera frame, a visual-sounding request, or an explicit
@@ -204,6 +222,7 @@ class Orchestrator:
         images = self._collect_images(retrieval, live_image_path, want_diagram)
         attached_diagram_ids = self._attached_diagram_ids(retrieval, want_diagram)
 
+        t_prompt = time.perf_counter()
         prompt = prompt_builder.build_prompt(
             query=query,
             retrieval=retrieval,
@@ -214,6 +233,7 @@ class Orchestrator:
             attached_diagram_ids=attached_diagram_ids,
             # Facts are pre-resolved, so there is exactly one pass and no tool requests.
             force_final=True,
+            current_step_id=step_id,
         )
         return {
             "retrieval": retrieval,
@@ -223,6 +243,7 @@ class Orchestrator:
             "attached_diagram_ids": attached_diagram_ids,
             "prompt": prompt,
             "retrieve_ms": retrieve_ms,
+            "prompt_ms": (time.perf_counter() - t_prompt) * 1000,
         }
 
     def _finalize_decision(self, decision: Decision | None) -> Decision:
@@ -241,7 +262,8 @@ class Orchestrator:
         return decision
 
     def _build_result(
-        self, query: str, decision: Decision, ctx: dict[str, Any], tts_path
+        self, query: str, decision: Decision, ctx: dict[str, Any], tts_path,
+        parse_valid: bool = True,
     ) -> dict[str, Any]:
         retrieval = ctx["retrieval"]
         # Only surface to the client the diagram(s) actually shown to the model this turn,
@@ -259,9 +281,10 @@ class Orchestrator:
             "tool_calls": ctx["resolved_facts"],
             "sensor_snapshot": ctx["snapshot"],
             "tts_path": str(tts_path) if tts_path else None,
+            "parse_valid": parse_valid,
         }
 
-    def _resolve_reference_facts(self, proc: Procedure | None) -> list[dict[str, Any]]:
+    def _resolve_reference_facts(self, proc: Procedure | None, step_id: int | None = None) -> list[dict[str, Any]]:
         """Look up the torque specs and part/tool availability the procedure references.
 
         Done deterministically from the corpus (not by the model) so the reasoning pass
@@ -290,7 +313,7 @@ class Orchestrator:
             if isinstance(cond, dict) and cond.get("part"):
                 part_ids.add(cond["part"])
 
-        for step in proc.steps:
+        for step in (s for s in proc.steps if step_id is None or s.get("id") == step_id):
             for cond in step.get("preconditions") or []:
                 if isinstance(cond, dict) and cond.get("part"):
                     part_ids.add(cond["part"])

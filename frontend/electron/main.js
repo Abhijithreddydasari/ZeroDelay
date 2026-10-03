@@ -52,9 +52,8 @@ function startServer() {
   });
 }
 
-// TODO: real integration — this is where the packaged app would also spawn
-// or connect to the local Ollama process and the voice pipeline backend,
-// instead of the frontend running fully standalone with mock data.
+// The frontend connects to the Python API; start the backend separately.
+// TODO: bundle and launch the backend from the packaged desktop app.
 async function createWindow() {
   await startServer();
   const win = new BrowserWindow({

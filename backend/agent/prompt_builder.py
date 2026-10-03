@@ -39,6 +39,7 @@ def build_prompt(
     has_live_image: bool = False,
     attached_diagram_ids: list[str] | None = None,
     force_final: bool = False,
+    current_step_id: int | None = None,
 ) -> str:
     parts: list[str] = [RULEBOOK, ""]
 
@@ -48,7 +49,7 @@ def build_prompt(
         proc = corpus.procedures.get(retrieval.top_procedure_id)
     if proc:
         parts.append("RETRIEVED PROCEDURE (structured, source of truth):")
-        parts.append(_render_procedure(proc))
+        parts.append(_render_procedure(proc, current_step_id))
         parts.append("")
 
     # Other candidate procedures (titles only, for disambiguation).
@@ -128,7 +129,7 @@ def relevant_sensor_names(corpus: Corpus, retrieval: RetrievalResult) -> list[st
     return proc.sensors_watched if proc else []
 
 
-def _render_procedure(proc: Procedure) -> str:
+def _render_procedure(proc: Procedure, current_step_id: int | None = None) -> str:
     """Compact, token-efficient view of the procedure's typed steps.
 
     Summarizes each step to just what the model needs to enforce order + safety
@@ -143,7 +144,8 @@ def _render_procedure(proc: Procedure) -> str:
     if entry:
         lines.append(f"entry_conditions: {_compact_conditions(entry)}")
     lines.append("steps:")
-    for step in proc.steps:
+    steps = proc.steps if current_step_id is None else [s for s in proc.steps if s.get("id") == current_step_id]
+    for step in steps:
         tier = step.get("safety_tier", "routine")
         lines.append(f"  {step.get('id')} [{tier}] {_one_line(step.get('title', ''))}")
         if step.get("instruction"):

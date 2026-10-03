@@ -65,7 +65,7 @@ verify:
   sensor: suit_pressure_psia
   check: in_range
   # visual:
-  visual_ref: airlock-valves    # diagram id; ground truth in annotations/<id>.yaml
+  visual_ref: airlock-valves    # diagram id; image at diagrams/<id>.png
   expect_state: "gauge reads < 2 psia; equalization valve handle vertical"
   # verbal:
   prompt: "Say 'confirm' when the tether is clipped to the structural hard point."

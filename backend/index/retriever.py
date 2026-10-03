@@ -51,7 +51,7 @@ class Retriever:
         self.db_path = db_path or config.VECTOR_DB_PATH
         self.corpus: Corpus = load_corpus()
 
-    def _search(self, query: str, doc_type: str, k: int) -> list[tuple]:
+    def _search(self, query: str) -> list[tuple]:
         qvec = embedder.embed_query(query)
         conn = connect(self.db_path)
         try:
@@ -73,8 +73,7 @@ class Retriever:
             ).fetchall()
         finally:
             conn.close()
-        filtered = [r for r in rows if r[0] == doc_type]
-        return filtered[:k]
+        return rows
 
     def retrieve(
         self,
@@ -86,13 +85,18 @@ class Retriever:
         k_proc = k_procedures or config.RETRIEVAL_TOP_K
         result = RetrievalResult(query=query)
 
-        for _dt, ref_id, title, _img, dist in self._search(query, "procedure", k_proc):
+        rows = self._search(query)
+        for _dt, ref_id, title, _img, dist in (r for r in rows if r[0] == "procedure"):
+            if len(result.procedures) >= k_proc:
+                break
             result.procedures.append(
                 RetrievedProcedure(ref_id, title, _distance_to_score(dist))
             )
 
         diagram_hits: dict[str, RetrievedDiagram] = {}
-        for _dt, ref_id, title, image_path, dist in self._search(query, "diagram", k_diagrams):
+        for _dt, ref_id, title, image_path, dist in (r for r in rows if r[0] == "diagram"):
+            if len(diagram_hits) >= k_diagrams:
+                break
             diagram_hits[ref_id] = RetrievedDiagram(
                 diagram_id=ref_id,
                 title=title,

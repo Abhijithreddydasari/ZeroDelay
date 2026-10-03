@@ -40,9 +40,9 @@ TTS_OUTPUT_DIR = ARTIFACTS_DIR / "tts"
 # ---------------------------------------------------------------------------
 # Models (Hugging Face ids; downloaded once, then run offline)
 # ---------------------------------------------------------------------------
-# Main brain: audio STT + text reasoning + image vision. Switch to E2B on tight VRAM.
+# Gemma handles reasoning + vision, plus optional legacy ASR. E2B needs validation.
 GEMMA_MODEL_ID = os.environ.get("ZD_GEMMA_MODEL", "google/gemma-4-E4B-it")
-GEMMA_FALLBACK_MODEL_ID = "google/gemma-4-E2B-it"
+GEMMA_FALLBACK_MODEL_ID = "google/gemma-4-E2B-it"  # No automatic fallback is applied.
 
 # Load Gemma in 4-bit (bitsandbytes) to fit 8GB GPUs. Audio modules stay bf16.
 GEMMA_LOAD_IN_4BIT = os.environ.get("ZD_GEMMA_4BIT", "1") == "1"
@@ -98,6 +98,8 @@ RETRIEVAL_TOP_K = _env_int("ZD_TOP_K", 3)
 TOOL_LOOP_MAX_ITERS = _env_int("ZD_TOOL_LOOP", 2)
 GEMMA_MAX_NEW_TOKENS = _env_int("ZD_MAX_NEW_TOKENS", 512)
 ASR_MAX_NEW_TOKENS = _env_int("ZD_ASR_MAX_NEW_TOKENS", 128)
+ASR_BACKEND = os.environ.get("ZD_ASR_BACKEND", "faster-whisper")
+ASR_MODEL_ID = os.environ.get("ZD_ASR_MODEL", "Systran/faster-whisper-small.en")
 
 # Vision gating. Feeding a ~1MP schematic runs Gemma's vision encoder — the biggest
 # per-turn cost — and most turns don't need it. "auto" attaches a diagram only when the

@@ -6,11 +6,10 @@ offline, voice-guided repair/maintenance copilot. Built with Next.js
 wrapper for a real installable desktop app.
 
 The voice app is **wired to the ZeroDelay backend** ([`../backend`](../backend)) over
-HTTP: it records the mic, POSTs each turn to `/converse`, and plays back the reply —
-real Gemma speech-to-text, retrieval, reasoning, diagram vision, and Piper TTS,
-alongside a live telemetry panel driven by the `/sensors` endpoints. The only piece
-still faked is the step checklist shown in the overlay (one hardcoded demo procedure);
-see [the notes below](#notes-on-the-demo-state).
+HTTP: it records the mic, streams each turn to `/converse/stream`, and plays
+Piper audio chunks. The backend uses faster-whisper ASR, a persisted procedure
+state engine for routine commands, and Gemma for open-ended questions and vision.
+The checklist comes from the backend's active procedure.
 
 ## Structure
 
@@ -25,10 +24,10 @@ components/
   app-shell/            Sidebar, VoiceVisual, StepOverlay, SensorsPanel, LoginForm
 lib/
   api.ts                 Thin HTTP client for the FastAPI backend (+ diagram URLs)
-  useVoiceLoop.ts        Hands-free loop: record mic -> /converse -> play TTS reply
+  useVoiceLoop.ts        Hands-free loop: record mic -> /converse/stream -> play audio
   audio.ts               PCM -> WAV encode + base64-WAV decode helpers
   sessions.ts            On-device (localStorage) persistence for past discussions
-  mock-data.ts           The one hardcoded demo procedure (drives the step overlay)
+  mock-data.ts           Legacy demo data; no longer drives the step overlay
   types.ts               Shared types, incl. the backend decision/sensor contract
 electron/
   main.js                Electron entry point — serves the static export
@@ -61,6 +60,8 @@ Open http://localhost:3000. Routes:
 The landing page works on its own, but `/app` needs the backend running on
 `http://127.0.0.1:8000` (see [`../backend/README.md`](../backend/README.md)). Point it
 at a different host with `NEXT_PUBLIC_ZD_API`.
+The desktop package also needs that Python service running separately; it does
+not bundle the backend or model weights. Check `/ready` before the voice demo.
 
 ## Build the desktop app (macOS)
 
@@ -92,15 +93,14 @@ be added once that's needed.
 
 ## Notes on the demo state
 
-- Voice, retrieval, reasoning, diagrams, and speech are **real**: every turn is
-  recorded, POSTed to the backend's `/converse`, transcribed by Gemma, answered as a
-  structured decision, and played back as Piper TTS audio. The AI's "speaking" turn is
-  that audio, not an animation. The telemetry panel and its "inject fault" buttons hit
-  the live `/sensors` endpoints.
+- Voice, retrieval, reasoning, diagrams, and speech use the local backend. The
+  procedure engine handles routine commands and Gemma handles open-ended turns.
+  The telemetry panel and fault buttons use `/sensors`.
 - Turn-taking is voice-activity detection (speak, then pause) rather than a wake word —
   a short pause ends your turn and sends the clip.
-- The step checklist in the overlay is still one hardcoded demo procedure
-  (`lib/mock-data.ts`, adapted from `data/procedures/01-eva-prep-emu-airlock.md`); the
-  pointer just advances locally whenever the backend returns an `advance` decision.
-- Sessions and their full threads are saved in `localStorage`, so past discussions
-  survive a reload and nothing leaves the device.
+- The step checklist uses the backend's authoritative state. Older saved
+  transcripts remain visible, but their local step pointer is discarded when
+  resumed; the procedure must be selected and confirmed again.
+- Transcripts and backend session IDs are saved in `localStorage`; authoritative
+  procedure state is in `backend/artifacts/sessions.sqlite`. Both are needed to
+  resume a current session with its transcript.

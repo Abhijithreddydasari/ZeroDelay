@@ -82,36 +82,37 @@ This isn't a cloud product with an "offline mode" bolted on. It was built offlin
 
 ## How it works
 
-One multimodal Gemma model does the heavy lifting: speech-to-text, reasoning, *and* reading diagrams. Retrieval only decides *which* procedure applies; the exact numbers come from tool calls, not fuzzy text search.
+Speech recognition runs on the CPU. A persistent procedure session handles confirmations and common commands directly from verified steps and live sensors; Gemma handles open-ended questions and diagrams. Retrieval helps select the initial procedure, while exact values come from structured reference data and sensor readings.
 
 ```
  voice in
     │
     ▼
- Gemma (STT)  ──►  EmbeddingGemma + sqlite-vec retrieval  ──►  which procedure + diagram?
-    │                                                                    │
-    ▼                                                                    ▼
- prompt = rules + typed steps + live telemetry + tool results + diagram image
+ faster-whisper (STT)
     │
     ▼
- Gemma (reasoning + vision)  ──►  structured JSON decision
-    │                                   │
-    │              needs an exact fact? │  (torque / sensor / inventory / fault branch)
-    │                                   ▼
-    │                          deterministic tool call ──┐
-    │◄──────────────────────────────────────────────────┘  (loop, then commit)
-    ▼
- Piper (TTS)  ──►  spoken guidance out
+ SQLite procedure session + current step + live sensor checks
+    │
+    ├── confirm / repeat / next ──► verified step guidance
+    │
+    └── open-ended question ──► Gemma (reasoning + vision) ──► validated decision
+                                  │
+                                  ▼
+ Piper (TTS)  ◄───────────────────┘
 ```
 
-Every turn ends in a typed **decision** (`advance`, `block`, `branch`, `escalate`, `emergency`, `clarify`, and friends) carrying the spoken text, the step it applies to, its citations, and a risk note. That structure is what lets the app track procedure state and enforce the safety gate instead of just narrating paragraphs.
+Every turn ends in a typed **decision** and authoritative procedure state. Procedure changes and step advances are controlled by the backend, with confirmation, precondition, inventory, and sensor checks.
 
 ### What makes it more than a chatbot
 
 - **Grounded retrieval, deterministic facts.** Vector search picks the procedure; `read_sensor`, `get_torque_spec`, `check_inventory`, and `lookup_fault_tree` supply the exact values from machine-readable reference tables.
 - **Typed procedure engine.** Each step carries a safety tier, preconditions, and a verification method (`sensor`, `visual`, or `verbal`).
 - **Sees what you see.** The vision model reads equipment schematics directly to help verify a step.
-- **Safety-tiered execution.** Routine steps flow; caution and critical steps demand explicit spoken confirmation; a critical sensor reading triggers emergency mode.
+- **Safety-tiered execution.** Routine steps require confirmation; critical steps require a specific read-back. Preconditions and live sensors can block progress or trigger emergency mode.
+
+**Current validation:** warmed synthetic procedure voice turns measured **3.15 s p95
+to the first server audio event**. Open-ended model turns are slower; microphone
+latency and E2B remain unverified. Details: [`backend/PERFORMANCE.md`](backend/PERFORMANCE.md).
 
 ---
 
@@ -158,27 +159,30 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install -r backend\requirements.txt
 
 # Log in once and pull the (gated) Gemma weights — one-time, then offline forever
-huggingface-cli login
-huggingface-cli download google/gemma-4-E4B-it        # brain: STT + text + vision
-huggingface-cli download google/embeddinggemma-300M   # retrieval embeddings
+hf auth login
+hf download google/gemma-4-E4B-it        # reasoning + vision
+hf download google/embeddinggemma-300M   # retrieval embeddings
+hf download Systran/faster-whisper-small.en # CPU speech recognition
 # + one Piper voice into backend\models\piper\  (see backend/README.md)
 
-# Build the offline vector index, then start the API
+# Build the index, then start the API with cached models only
 python -m backend.index.build_index
-uvicorn backend.api.server:app --port 8000
+$env:ZD_OFFLINE="1"
+python -m uvicorn backend.api.server:app --port 8000
 ```
 
-Prove it's really offline:
+Check readiness in another PowerShell window before the offline demo:
 
 ```powershell
-$env:ZD_OFFLINE="1"   # forbids every network call — now pull the cable
+Invoke-RestMethod http://127.0.0.1:8000/ready
+# Wait for ready=true, then disconnect the network and exercise /app.
 ```
 
 Prefer no frontend? The pipeline is fully driveable from the terminal:
 
 ```powershell
 python -m backend.cli ask "coolant loop pressure is dropping, what do I do?"
-python -m backend.cli converse MarsMind\astronaut_query.wav   # voice → STT → agent → spoken reply
+python -m backend.benchmark_voice              # synthetic voice → ASR → procedure → audio output
 ```
 
 ### 2. Frontend
@@ -197,9 +201,9 @@ To ship it as a real installable desktop app, `npm run dist:mac` produces a pack
 
 | Layer | What we used |
 | --- | --- |
-| On-device model | **Gemma** (E4B-it, with an E2B-it fallback): one multimodal model for STT, reasoning, and vision, in 4-bit via `bitsandbytes` |
+| On-device model | **Gemma** E4B-it for reasoning and vision, in 4-bit via `bitsandbytes` |
 | Retrieval | **EmbeddingGemma-300M** + **sqlite-vec** |
-| Voice | **Gemma** speech-to-text · **Piper** text-to-speech · Silero VAD |
+| Voice | **faster-whisper** speech-to-text · **Piper** text-to-speech · Silero VAD |
 | Backend | **Python**, **FastAPI**, `transformers`, `sentence-transformers` |
 | Frontend | **Next.js** (App Router), **React**, **TypeScript**, **Tailwind CSS**, **Framer Motion** |
 | Desktop | **Electron** |

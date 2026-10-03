@@ -7,6 +7,8 @@ to fit an 8GB GPU. Fully offline after the weights are downloaded once.
 from __future__ import annotations
 
 import threading
+import time
+from queue import Empty
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,10 @@ class GemmaRuntime:
         self._lock = threading.Lock()
         # Serializes generation so concurrent API requests don't interleave on one GPU.
         self._gen_lock = threading.Lock()
+        self._metrics_local = threading.local()
+
+    def last_metrics(self) -> dict:
+        return getattr(self._metrics_local, "last", {})
 
     # ------------------------------------------------------------------
     # Loading
@@ -118,19 +124,30 @@ class GemmaRuntime:
         max_new_tokens: int,
         thinking: bool = False,
     ) -> str:
+        started = time.perf_counter()
         self.load()
+        load_ms = round((time.perf_counter() - started) * 1000)
         import torch
 
+        stage = time.perf_counter()
         inputs = self._build_inputs(messages, thinking)
+        tokenize_ms = round((time.perf_counter() - stage) * 1000)
         input_len = inputs["input_ids"].shape[-1]
+        stage = time.perf_counter()
         with self._gen_lock, torch.inference_mode():
             generated = self._model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
             )
+        generate_ms = round((time.perf_counter() - stage) * 1000)
         new_tokens = generated[0][input_len:]
-        return self._processor.decode(new_tokens, skip_special_tokens=True).strip()
+        stage = time.perf_counter()
+        answer = self._processor.decode(new_tokens, skip_special_tokens=True).strip()
+        self._metrics_local.last = {"model_load": load_ms, "tokenize": tokenize_ms,
+            "generate": generate_ms, "decode": round((time.perf_counter() - stage) * 1000),
+            "input_tokens": int(input_len), "output_tokens": int(new_tokens.shape[-1])}
+        return answer
 
     def _generate_stream(
         self,
@@ -150,8 +167,9 @@ class GemmaRuntime:
         inputs = self._build_inputs(messages, thinking)
         tokenizer = getattr(self._processor, "tokenizer", self._processor)
         streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=True
+            tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=120
         )
+        error: list[Exception] = []
         generation_kwargs = dict(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -161,22 +179,27 @@ class GemmaRuntime:
 
         def _run() -> None:
             try:
-                with torch.inference_mode():
+                with self._gen_lock, torch.inference_mode():
                     self._model.generate(**generation_kwargs)
-            except Exception:
-                # The consumer just sees the stream end; the caller parses whatever
-                # text arrived (leniently, with a fallback decision).
-                pass
+            except Exception as exc:
+                error.append(exc)
+                streamer.end()
 
-        with self._gen_lock:
-            thread = threading.Thread(target=_run, daemon=True)
-            thread.start()
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        try:
             try:
                 for text in streamer:
                     if text:
                         yield text
-            finally:
-                thread.join()
+            except Empty as exc:
+                raise TimeoutError("Gemma emitted no stream data for 120 seconds.") from exc
+        finally:
+            thread.join(timeout=5)
+        if error:
+            raise error[0]
+        if thread.is_alive():
+            raise TimeoutError("Gemma generation did not finish after the stream ended.")
 
     # ------------------------------------------------------------------
     # Public API
