@@ -58,14 +58,13 @@ SCHEMA_HINT = """Return ONLY a single JSON object, no prose, no code fences, wit
   "procedure_id": "e.g. EVA-PREP-001 or null",
   "step_id": 7,
   "citations": ["manual:EVA-PREP-001#7", "sensor:airlock_pressure_psia=14.6 (critical)"],
-  "tool_request": {"tool": "read_sensor", "args": {"name": "airlock_pressure_psia"}},
+  "tool_request": null,
   "risk": "text or null",
   "needs_clarification": "one question or null",
   "confidence": 0.0
 }
-Use "tool_request" when you need an exact fact (a sensor value, torque spec, part
-availability, or fault-tree branch) before you can safely answer. Otherwise set
-tool_request to null and give your final decision."""
+All the reference facts you need (sensor readings, torque specs, part availability) are
+provided above. Keep "tool_request" null and give your final decision now."""
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:

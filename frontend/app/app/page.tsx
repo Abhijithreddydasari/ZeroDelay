@@ -5,11 +5,10 @@ import Sidebar from "@/components/app-shell/Sidebar";
 import VoiceVisual from "@/components/app-shell/VoiceVisual";
 import StepOverlay from "@/components/app-shell/StepOverlay";
 import SensorsPanel from "@/components/app-shell/SensorsPanel";
-import { activeProcedure } from "@/lib/mock-data";
 import { useVoiceLoop } from "@/lib/useVoiceLoop";
 import { loadSessions, saveSessions, type StoredSession } from "@/lib/sessions";
-import { diagramUrl, type RetrievedDiagram } from "@/lib/api";
-import type { Decision, DecisionAction } from "@/lib/types";
+import { createSession, diagramUrl, getSession, type RetrievedDiagram } from "@/lib/api";
+import type { Decision, DecisionAction, SessionState } from "@/lib/types";
 
 const actionMeta: Record<DecisionAction, { label: string; className: string }> = {
   advance: { label: "Advance", className: "bg-accent-100 text-accent-700" },
@@ -24,11 +23,13 @@ const actionMeta: Record<DecisionAction, { label: string; className: string }> =
   tool_request: { label: "Checking", className: "bg-subtle text-secondary" },
 };
 
-function makeSession(id: string): StoredSession {
+function makeSession(state: SessionState): StoredSession {
   return {
-    id,
+    id: state.id,
     title: "New discussion",
-    procedureId: activeProcedure.id,
+    procedureId: state.procedure_id || "",
+    backendSessionId: state.id,
+    backendState: state,
     updatedAt: "Just now",
     stepIndex: 0,
     completed: false,
@@ -40,6 +41,7 @@ export default function AppPage() {
   const [sessions, setSessions] = useState<StoredSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
 
   // Hydrate saved sessions once on the client, then persist on every change.
@@ -56,19 +58,14 @@ export default function AppPage() {
     [sessions, selectedId]
   );
 
-  // Apply the backend's structured decision: append the turn to the thread and
-  // move the local step pointer. The frontend owns state; the backend steers it.
+  // Render the backend's authoritative state alongside the local transcript.
   const handleDecision = useCallback(
-    (decision: Decision, query: string, diagram?: RetrievedDiagram | null) => {
+    (decision: Decision, query: string, diagram?: RetrievedDiagram | null, state?: SessionState) => {
+      if (!state) return;
       setSessions((prev) =>
         prev.map((s) => {
-          if (s.id !== selectedId) return s;
-          let stepIndex = s.stepIndex;
-          let completed = s.completed;
-          if (decision.action === "advance") {
-            if (stepIndex >= activeProcedure.steps.length - 1) completed = true;
-            else stepIndex += 1;
-          }
+          if (s.backendSessionId !== state.id) return s;
+          const stepIndex = state.procedure?.steps.findIndex((step) => step.id === state.step_id) ?? 0;
           const hasUserTurn = s.messages.some((m) => m.role === "user");
           const title = hasUserTurn
             ? s.title
@@ -77,7 +74,9 @@ export default function AppPage() {
             ...s,
             title,
             stepIndex,
-            completed,
+            completed: state.completed,
+            procedureId: state.procedure_id || "",
+            backendState: state,
             updatedAt: "Just now",
             messages: [
               ...s.messages,
@@ -96,26 +95,53 @@ export default function AppPage() {
         })
       );
     },
-    [selectedId]
+    []
   );
 
-  const sessionActive = current !== null && !current.completed;
-  const voice = useVoiceLoop({ active: sessionActive, onDecision: handleDecision });
+  const sessionActive = current !== null && !!current.backendSessionId &&
+    !current.completed && !current.backendState?.halted;
+  const voice = useVoiceLoop({ active: sessionActive, sessionId: current?.backendSessionId ?? null, onDecision: handleDecision });
 
-  // Keep the thread scrolled to the latest turn / thinking indicator.
+  // Keep the thread scrolled to the latest turn / thinking indicator (including as
+  // the streamed answer grows).
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [current?.messages.length, voice.phase]);
+  }, [current?.messages.length, voice.phase, voice.partial]);
 
-  function startNewSession() {
-    const id = `session-${Date.now()}`;
-    setSessions((prev) => [makeSession(id), ...prev]);
-    setSelectedId(id);
+  async function startNewSession() {
+    try {
+      const state = await createSession();
+      setSessions((prev) => [makeSession(state), ...prev]);
+      setSelectedId(state.id);
+      setSessionError(null);
+    } catch {
+      setSessionError("Backend unavailable. Start the backend before creating a session.");
+    }
+  }
+
+  async function selectSession(id: string) {
+    const saved = sessions.find((s) => s.id === id);
+    if (!saved) return;
+    try {
+      const state = saved.backendSessionId
+        ? await getSession(saved.backendSessionId)
+        : await createSession(); // Legacy transcript stays; its step pointer is untrusted.
+      setSessions((prev) => prev.map((s) => s.id === id ? {
+        ...s, backendSessionId: state.id, backendState: state,
+        procedureId: state.procedure_id || "", stepIndex: 0, completed: state.completed,
+      } : s));
+      setSelectedId(id);
+      setSessionError(null);
+    } catch {
+      setSessionError("Could not resume this session from the backend.");
+    }
   }
 
   const lastAi = current?.messages.filter((m) => m.role === "ai").at(-1);
   const emergency = lastAi?.action === "emergency";
-  const step = activeProcedure.steps[current?.stepIndex ?? 0];
+  const procedure = current?.backendState?.procedure;
+  const stepIndex = procedure?.steps.findIndex((s) => s.id === current?.backendState?.step_id) ?? -1;
+  const step = stepIndex >= 0 ? procedure?.steps[stepIndex] : undefined;
 
   const statusText =
     voice.permission === "pending"
@@ -136,7 +162,7 @@ export default function AppPage() {
           updatedAt: s.updatedAt,
         }))}
         activeId={selectedId}
-        onSelect={setSelectedId}
+        onSelect={selectSession}
         onNewSession={startNewSession}
       />
 
@@ -147,6 +173,7 @@ export default function AppPage() {
               Click &quot;+ New&quot; to start a hands-free walkthrough, then describe
               the fault out loud. Say &quot;next step&quot; when a step is done.
             </p>
+            {sessionError && <p className="text-sm text-danger-text">{sessionError}</p>}
           </div>
         ) : voice.permission === "denied" ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
@@ -167,12 +194,18 @@ export default function AppPage() {
                 </div>
               )}
 
-              {!current.completed && (
+              {!current.completed && step && (
                 <StepOverlay
                   step={step}
-                  stepNumber={current.stepIndex + 1}
-                  totalSteps={activeProcedure.steps.length}
+                  stepNumber={stepIndex + 1}
+                  totalSteps={procedure?.steps.length ?? 0}
                 />
+              )}
+
+              {!step && !current.completed && (
+                <p className="rounded-2xl border border-dashed border-border px-4 py-4 text-center text-sm text-muted">
+                  Name the airlock, coolant, battery, or CDRA procedure. Confirm the suggested procedure before starting.
+                </p>
               )}
 
               {current.messages.length === 0 && (
@@ -235,11 +268,24 @@ export default function AppPage() {
 
               {voice.phase === "thinking" && (
                 <div className="flex justify-start">
-                  <div className="flex items-center gap-1.5 rounded-2xl rounded-bl-sm border border-border bg-card px-4 py-3 shadow-sm">
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.3s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.15s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
-                  </div>
+                  {voice.partial ? (
+                    // The answer streaming in live, token by token.
+                    <div className="max-w-[92%] rounded-2xl rounded-bl-sm border border-border bg-card px-4 py-3 text-sm shadow-sm">
+                      <div className="mb-1 flex items-center gap-2">
+                        <span className="text-xs font-medium text-primary">ZeroDelay</span>
+                      </div>
+                      <p className="leading-relaxed text-secondary">
+                        {voice.partial}
+                        <span className="ml-0.5 inline-block h-3.5 w-[2px] translate-y-0.5 animate-pulse rounded-sm bg-muted align-middle" />
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 rounded-2xl rounded-bl-sm border border-border bg-card px-4 py-3 shadow-sm">
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.3s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.15s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -254,6 +300,7 @@ export default function AppPage() {
                   {voice.error}
                 </p>
               )}
+              {sessionError && <p className="text-sm text-danger-text">{sessionError}</p>}
 
               <div ref={endRef} />
             </div>

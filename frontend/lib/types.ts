@@ -17,6 +17,18 @@ export type Procedure = {
   steps: Step[];
 };
 
+export type SessionState = {
+  id: string;
+  procedure_id: string | null;
+  step_id: number | null;
+  completed_step_ids: number[];
+  pending_procedure_id: string | null;
+  pending_confirmation: boolean;
+  completed: boolean;
+  halted: boolean;
+  procedure: Procedure | null;
+};
+
 export type Conversation = {
   id: string;
   title: string;

@@ -1,15 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Decision, MicPermission, VoicePhase } from "./types";
-import { ApiError, converse, type RetrievedDiagram } from "./api";
+import type { Decision, MicPermission, SessionState, VoicePhase } from "./types";
+import {
+  ApiError,
+  converse,
+  converseStream,
+  type ConverseResponse,
+  type RetrievedDiagram,
+} from "./api";
 import { base64ToArrayBuffer, encodeWav, mergeChunks } from "./audio";
 
 export type { VoicePhase };
 
 // Real voice loop wiring the ZeroDelay backend into the app shell:
-//   listen (record mic PCM) -> WAV -> POST /converse (STT + RAG + reason + TTS)
-//   -> play the returned TTS audio -> back to listening.
+//   listen (record mic PCM) -> WAV -> POST /converse/stream (ASR + session + TTS)
+//   -> play validated audio chunks -> back to listening.
 // The same Web Audio amplitude drives the VoiceVisual orb for both the human's
 // turn (mic input) and the AI's turn (TTS playback).
 
@@ -20,18 +26,21 @@ const SILENCE_CONFIRM_MS = 900; // pause that ends the technician's turn
 
 type Options = {
   active: boolean;
+  sessionId: string | null;
   onDecision?: (
     decision: Decision,
     query: string,
-    diagram?: RetrievedDiagram | null
+    diagram?: RetrievedDiagram | null,
+    session?: SessionState
   ) => void;
 };
 
-export function useVoiceLoop({ active, onDecision }: Options) {
+export function useVoiceLoop({ active, sessionId, onDecision }: Options) {
   const [permission, setPermission] = useState<MicPermission>("idle");
   const [phase, setPhase] = useState<VoicePhase>("idle");
   const [amplitude, setAmplitude] = useState(0);
   const [transcript, setTranscript] = useState<string | null>(null);
+  const [partial, setPartial] = useState(""); // spoken answer streaming in, live
   const [decision, setDecision] = useState<Decision | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -109,23 +118,53 @@ export function useVoiceLoop({ active, onDecision }: Options) {
 
   const handleUtterance = useCallback(
     async (wav: Blob) => {
-      if (busyRef.current) return;
+      if (busyRef.current || !sessionId) return;
       busyRef.current = true;
       setError(null);
+      setPartial("");
       setPhaseSafe("thinking");
       setAmplitude(0.16); // gentle "alive" pulse while the model thinks
 
+      let playback = Promise.resolve();
       try {
-        const res = await converse(wav);
-        setTranscript(res.query);
+        // Receive validated audio, then apply the backend's final session state.
+        let res: ConverseResponse;
+        const turnId = crypto.randomUUID();
+        let audioPlayed = false;
+        try {
+          res = await converseStream(wav, sessionId, turnId, {
+            onQuery: (q) => setTranscript(q),
+            onDelta: (t) => setPartial((prev) => prev + t),
+            onAudioChunk: (chunk) => {
+              audioPlayed = true;
+              playback = playback.then(() => playWav(chunk));
+            },
+          });
+        } catch (e) {
+          // Retry only before any stream event. The same turn ID makes replay safe.
+          if (e instanceof ApiError && (e.status === 422 || e.started)) throw e;
+          setPartial("");
+          res = await converse(wav, sessionId, turnId);
+          setTranscript(res.query);
+        }
+        // The final decision carries the authoritative spoken text, so drop the
+        // live preview and let the parent render the completed AI message.
+        setPartial("");
         setDecision(res.decision);
         // Surface the most relevant retrieved diagram that actually has an image
         // (matches the one the backend feeds its vision model).
         const diagram =
           res.retrieval?.diagrams?.find((d) => d.image_exists) ?? null;
-        onDecisionRef.current?.(res.decision, res.query, diagram);
-        if (res.tts_wav_base64) await playWav(res.tts_wav_base64);
+        onDecisionRef.current?.(res.decision, res.query, diagram, res.session);
+        if (!audioPlayed && res.audio_chunks_base64?.length) {
+          for (const chunk of res.audio_chunks_base64) playback = playback.then(() => playWav(chunk));
+        } else if (!audioPlayed && res.tts_wav_base64) {
+          playback = playback.then(() => playWav(res.tts_wav_base64!));
+        }
+        await playback;
       } catch (e) {
+        // Keep the mic disarmed until any already received audio has finished.
+        await playback.catch(() => {});
         if (e instanceof ApiError && e.status === 422) {
           setError("Didn't catch that — please try again.");
         } else if (e instanceof ApiError) {
@@ -135,6 +174,7 @@ export function useVoiceLoop({ active, onDecision }: Options) {
         }
       } finally {
         busyRef.current = false;
+        setPartial("");
         armCapture();
         // Return to listening only if the session is still open.
         if (ctxRef.current) setPhaseSafe("listening");
@@ -142,7 +182,7 @@ export function useVoiceLoop({ active, onDecision }: Options) {
         setAmplitude(0);
       }
     },
-    [armCapture, playWav, setPhaseSafe]
+    [armCapture, playWav, sessionId, setPhaseSafe]
   );
 
   useEffect(() => {
@@ -242,7 +282,7 @@ export function useVoiceLoop({ active, onDecision }: Options) {
       setAmplitude(0);
       setPhaseSafe("idle");
     };
-  }, [active, armCapture, handleUtterance, setPhaseSafe]);
+  }, [active, armCapture, handleUtterance, sessionId, setPhaseSafe]);
 
-  return { permission, phase, amplitude, transcript, decision, error };
+  return { permission, phase, amplitude, transcript, partial, decision, error };
 }
