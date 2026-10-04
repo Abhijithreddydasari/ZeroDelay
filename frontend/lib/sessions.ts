@@ -1,13 +1,15 @@
 // Local persistence for voice sessions so past discussions (and their full
 // conversation threads) survive reloads and can be reopened from the sidebar.
-// Everything stays on-device — no backend storage — which fits the offline model.
+// Transcripts stay in localStorage; procedure state is authoritative in backend SQLite.
 
-import type { Message } from "./types";
+import type { Message, SessionState } from "./types";
 
 export type StoredSession = {
   id: string;
   title: string;
   procedureId: string;
+  backendSessionId?: string;
+  backendState?: SessionState;
   updatedAt: string;
   stepIndex: number;
   completed: boolean;

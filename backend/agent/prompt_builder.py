@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import yaml
-
 from ..data_loader import Corpus, Procedure
 from ..index.retriever import RetrievalResult
 from .schema import SCHEMA_HINT
@@ -18,8 +16,8 @@ through hazardous maintenance work (space/EVA domain). You cannot reach the clou
 ground control in real time. Follow these rules:
 
 1. SAFETY FIRST. Never advance past a step whose safety preconditions are not met.
-2. GROUND EVERY FACT. For any sensor value, torque spec, part availability, or fault
-   branch, use a tool_request to get the exact value. Do NOT guess numbers.
+2. GROUND EVERY FACT. Base any sensor value, torque spec, or part availability ONLY on
+   the LIVE TELEMETRY and RESOLVED REFERENCE FACTS provided below. Do NOT guess numbers.
 3. RESPECT SAFETY TIERS. routine = brief confirm; caution = state warnings then confirm;
    critical = state warnings, require explicit confirmation, and re-check preconditions.
 4. CROSS-CHECK. If a live sensor contradicts what a step assumes (e.g. pressure too high
@@ -41,6 +39,7 @@ def build_prompt(
     has_live_image: bool = False,
     attached_diagram_ids: list[str] | None = None,
     force_final: bool = False,
+    current_step_id: int | None = None,
 ) -> str:
     parts: list[str] = [RULEBOOK, ""]
 
@@ -50,7 +49,7 @@ def build_prompt(
         proc = corpus.procedures.get(retrieval.top_procedure_id)
     if proc:
         parts.append("RETRIEVED PROCEDURE (structured, source of truth):")
-        parts.append(_render_procedure(proc))
+        parts.append(_render_procedure(proc, current_step_id))
         parts.append("")
 
     # Other candidate procedures (titles only, for disambiguation).
@@ -94,23 +93,33 @@ def build_prompt(
             )
         parts.append("")
 
-    # Tool results gathered so far in this turn.
+    # Reference facts resolved deterministically in code before this turn (sensor reads,
+    # torque specs, inventory) so the model never has to make a tool round-trip.
     if tool_results:
-        parts.append("TOOL RESULTS THIS TURN:")
+        parts.append("RESOLVED REFERENCE FACTS (already looked up — use these, do not ask for tools):")
         for tr in tool_results:
-            parts.append(f"- {tr}")
+            parts.append(f"- {_render_fact(tr)}")
         parts.append("")
 
     parts.append(f'TECHNICIAN SAID: "{query}"')
     parts.append("")
     if force_final:
         parts.append(
-            "You have no remaining tool budget. Do NOT return action \"tool_request\". "
-            "Give your best final decision using the facts already gathered above."
+            "Every reference fact you need is provided above. Do NOT return action "
+            "\"tool_request\" — give your final decision now, grounded in those facts."
         )
         parts.append("")
     parts.append(SCHEMA_HINT)
     return "\n".join(parts)
+
+
+def _render_fact(fact: dict[str, Any]) -> str:
+    """One-line view of a resolved tool fact for the prompt."""
+    tool = fact.get("tool", "?")
+    args = fact.get("args", {})
+    result = fact.get("result", {})
+    arg_str = ", ".join(f"{k}={v}" for k, v in (args or {}).items())
+    return f"{tool}({arg_str}) -> {result}"
 
 
 def relevant_sensor_names(corpus: Corpus, retrieval: RetrievalResult) -> list[str]:
@@ -120,48 +129,85 @@ def relevant_sensor_names(corpus: Corpus, retrieval: RetrievalResult) -> list[st
     return proc.sensors_watched if proc else []
 
 
-def _render_procedure(proc: Procedure) -> str:
-    """Render a trimmed, token-efficient view of the procedure's typed steps.
+def _render_procedure(proc: Procedure, current_step_id: int | None = None) -> str:
+    """Compact, token-efficient view of the procedure's typed steps.
 
-    Includes the entry conditions and per-step ordering/safety fields so the model can
-    actually enforce step order, dependencies, and skip-risk rules (not just prose).
+    Summarizes each step to just what the model needs to enforce order + safety
+    (tier, instruction, preconditions, verify, ordering, branches, failure action),
+    in a terse line format instead of a verbose YAML dump.
     """
     fm = proc.front_matter
-    header = {
-        "procedure_id": proc.procedure_id,
-        "title": proc.title,
-        "system": proc.system,
-        "summary": proc.summary,
-        "sensors_watched": proc.sensors_watched,
-        "related_diagrams": proc.related_diagrams,
-    }
-    for key in ("required_tools", "required_parts", "entry_conditions"):
-        if fm.get(key) is not None:
-            header[key] = fm.get(key)
-    trimmed_steps = []
-    for step in proc.steps:
-        trimmed_steps.append(
-            {
-                k: step.get(k)
-                for k in (
-                    "id",
-                    "title",
-                    "safety_tier",
-                    "instruction",
-                    "preconditions",
-                    "specs",
-                    "required_parts",
-                    "verify",
-                    "order_enforced",
-                    "must_precede",
-                    "depends_on_step",
-                    "risk_if_skipped",
-                    "on_failure",
-                    "warnings",
-                    "branches",
-                )
-                if step.get(k) is not None
-            }
+    lines: list[str] = [f"{proc.procedure_id} — {proc.title} (system: {proc.system})"]
+    if proc.summary:
+        lines.append(f"summary: {_one_line(proc.summary)}")
+    entry = fm.get("entry_conditions")
+    if entry:
+        lines.append(f"entry_conditions: {_compact_conditions(entry)}")
+    lines.append("steps:")
+    steps = proc.steps if current_step_id is None else [s for s in proc.steps if s.get("id") == current_step_id]
+    for step in steps:
+        tier = step.get("safety_tier", "routine")
+        lines.append(f"  {step.get('id')} [{tier}] {_one_line(step.get('title', ''))}")
+        if step.get("instruction"):
+            lines.append(f"     do: {_one_line(step['instruction'])}")
+        if step.get("preconditions"):
+            lines.append(f"     pre: {_compact_conditions(step['preconditions'])}")
+        if isinstance(step.get("verify"), dict):
+            lines.append(f"     verify: {_compact_verify(step['verify'])}")
+        for key in ("depends_on_step", "must_precede", "order_enforced"):
+            if step.get(key) is not None:
+                lines.append(f"     {key}: {step[key]}")
+        if step.get("branches"):
+            lines.append(f"     branches: {_compact_branches(step['branches'])}")
+        if isinstance(step.get("on_failure"), dict):
+            onf = step["on_failure"]
+            lines.append(f"     on_fail: {onf.get('action')} — {_one_line(onf.get('note', ''))}")
+        if step.get("risk_if_skipped"):
+            lines.append(f"     risk_if_skipped: {_one_line(step['risk_if_skipped'])}")
+        if step.get("warnings"):
+            joined = "; ".join(_one_line(w) for w in step["warnings"])
+            lines.append(f"     warnings: {joined}")
+    return "\n".join(lines)
+
+
+def _one_line(text: Any) -> str:
+    """Collapse any whitespace/newlines into a single spaced line."""
+    return " ".join(str(text or "").split())
+
+
+def _compact_conditions(conds: list[Any]) -> str:
+    out: list[str] = []
+    for c in conds or []:
+        if not isinstance(c, dict):
+            out.append(_one_line(c))
+            continue
+        subj = c.get("sensor") or c.get("part") or c.get("tool") or "?"
+        val = c.get("value", c.get("qty"))
+        piece = f"{subj} {c.get('check', '')}".strip()
+        if val is not None:
+            piece = f"{piece} {val}".strip()
+        out.append(piece)
+    return "; ".join(out)
+
+
+def _compact_verify(v: dict[str, Any]) -> str:
+    method = v.get("method", "")
+    if method == "sensor":
+        return _one_line(
+            f"sensor {v.get('sensor', '')} {v.get('check', '')} {v.get('value', '')}"
         )
-    doc = {"procedure": header, "steps": trimmed_steps}
-    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True).strip()
+    if method == "visual":
+        return _one_line(
+            f"visual ref={v.get('visual_ref', '')} expect={v.get('expect_state', '')}"
+        )
+    if method == "verbal":
+        return f"verbal — {_one_line(v.get('prompt', ''))}"
+    return method
+
+
+def _compact_branches(branches: list[Any]) -> str:
+    out: list[str] = []
+    for b in branches or []:
+        if isinstance(b, dict):
+            out.append(f"if '{_one_line(b.get('symptom', ''))}' -> {b.get('action', '')}")
+    return " | ".join(out)

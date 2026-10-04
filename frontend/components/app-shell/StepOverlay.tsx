@@ -1,4 +1,4 @@
-import Image from "next/image";
+import { API_BASE } from "@/lib/api";
 import type { Step } from "@/lib/types";
 
 const tierStyles: Record<Step["safetyTier"], string> = {
@@ -47,11 +47,10 @@ export default function StepOverlay({
 
       {step.diagram && (
         <div className="mt-4 overflow-hidden rounded-xl border border-border">
-          <Image
-            src={step.diagram}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={`${API_BASE}${step.diagram}`}
             alt={`${step.title} diagram`}
-            width={640}
-            height={360}
             className="h-auto w-full object-cover"
           />
         </div>

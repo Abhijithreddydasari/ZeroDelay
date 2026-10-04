@@ -1,9 +1,7 @@
 import type { Procedure } from "./types";
 
 // Adapted from data/procedures/01-eva-prep-emu-airlock.md (EVA-PREP-001).
-// TODO: replace with the real procedure engine — load + parse the YAML
-// front-matter from data/procedures/*.md via the retrieval step, instead of
-// this hardcoded excerpt.
+// Legacy demo fixture; the live step overlay now uses backend session data.
 export const activeProcedure: Procedure = {
   id: "EVA-PREP-001",
   title: "EMU Suit Checkout and Airlock Egress",

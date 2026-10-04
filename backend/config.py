@@ -40,12 +40,17 @@ TTS_OUTPUT_DIR = ARTIFACTS_DIR / "tts"
 # ---------------------------------------------------------------------------
 # Models (Hugging Face ids; downloaded once, then run offline)
 # ---------------------------------------------------------------------------
-# Main brain: audio STT + text reasoning + image vision. Switch to E2B on tight VRAM.
+# Gemma handles reasoning + vision, plus optional legacy ASR. E2B needs validation.
 GEMMA_MODEL_ID = os.environ.get("ZD_GEMMA_MODEL", "google/gemma-4-E4B-it")
-GEMMA_FALLBACK_MODEL_ID = "google/gemma-4-E2B-it"
+GEMMA_FALLBACK_MODEL_ID = "google/gemma-4-E2B-it"  # No automatic fallback is applied.
 
 # Load Gemma in 4-bit (bitsandbytes) to fit 8GB GPUs. Audio modules stay bf16.
 GEMMA_LOAD_IN_4BIT = os.environ.get("ZD_GEMMA_4BIT", "1") == "1"
+# Reasoning / "thinking" mode. This model's chat template exposes a hidden reasoning
+# channel gated by `enable_thinking` (OFF by default). Enabling it makes Gemma draft a
+# reasoning block before its final answer: often better on hard cases, but slower and
+# more tokens (bump ZD_MAX_NEW_TOKENS so the JSON decision still fits). STT never thinks.
+GEMMA_THINKING = os.environ.get("ZD_GEMMA_THINKING", "0") == "1"
 # Offline mode: force local-only model loading (no Hugging Face network calls). Required
 # for the offline/privacy demo. Enable with ZD_OFFLINE=1 once all models are cached.
 OFFLINE = os.environ.get("ZD_OFFLINE", "0") == "1"
@@ -93,6 +98,16 @@ RETRIEVAL_TOP_K = _env_int("ZD_TOP_K", 3)
 TOOL_LOOP_MAX_ITERS = _env_int("ZD_TOOL_LOOP", 2)
 GEMMA_MAX_NEW_TOKENS = _env_int("ZD_MAX_NEW_TOKENS", 512)
 ASR_MAX_NEW_TOKENS = _env_int("ZD_ASR_MAX_NEW_TOKENS", 128)
+ASR_BACKEND = os.environ.get("ZD_ASR_BACKEND", "faster-whisper")
+ASR_MODEL_ID = os.environ.get("ZD_ASR_MODEL", "Systran/faster-whisper-small.en")
+
+# Vision gating. Feeding a ~1MP schematic runs Gemma's vision encoder — the biggest
+# per-turn cost — and most turns don't need it. "auto" attaches a diagram only when the
+# turn looks visual (a live camera frame, or a visual-sounding request); "always" keeps
+# the old every-turn behavior; "off" never attaches a reference diagram.
+DIAGRAM_VISION = os.environ.get("ZD_DIAGRAM_VISION", "auto").strip().lower()
+# Log a per-turn latency breakdown (retrieve / generate / tts) to stdout for profiling.
+TIMING = os.environ.get("ZD_TIMING", "0") == "1"
 
 
 def ensure_dirs() -> None:

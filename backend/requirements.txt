@@ -20,9 +20,10 @@ soundfile>=0.12.1
 numpy>=1.26.0
 silero-vad>=5.1
 piper-tts>=1.2.0
-# Gemma 4's processor loads audio for STT via transformers' load_audio, which
-# requires librosa (soundfile alone is not enough for the /transcribe + /converse path).
+# librosa supports optional Gemma ASR and the legacy CLI audio path.
+# The default API recognizer is faster-whisper.
 librosa>=0.10.0
+faster-whisper>=1.1.0
 
 # Data parsing
 PyYAML>=6.0.2
