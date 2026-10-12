@@ -4,6 +4,7 @@ venv/
 env/
 MarsMind/conversations.json
 
+
 # Generated backend artifacts (vector index is rebuildable via build_index)
 backend/artifacts/
 *.sqlite
